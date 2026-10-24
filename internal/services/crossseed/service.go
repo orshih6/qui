@@ -8401,10 +8401,7 @@ func deduplicateScoredTorrentSearchResults(scored []scoredTorrentSearchResult) [
 	seen := make(map[string]struct{}, len(scored))
 	deduplicated := scored[:0]
 	for _, item := range scored {
-		key := item.result.GUID
-		if key == "" {
-			key = item.result.DownloadURL
-		}
+		key := searchResultDedupKey(item.result.GUID, item.result.DownloadURL)
 		if key == "" {
 			deduplicated = append(deduplicated, item)
 			continue

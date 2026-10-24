@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/autobrr/go-cache/ttlcache"
@@ -156,4 +157,69 @@ func TestSearchTorrentMatches_TraceCountsRawCandidates(t *testing.T) {
 	assert.Equal(t, 0, trace.FinalMatches)
 	require.Len(t, trace.Indexers, 1)
 	assert.Equal(t, 1, trace.Indexers[0].Candidates, "the indexer contributed one raw candidate")
+}
+
+// TestSearchTorrentMatches_TraceListsRepeatedRejectionOnce covers an indexer
+// that ignores the year: the yearless retry returns the same rejected result
+// again, and the trace must list and count it once.
+func TestSearchTorrentMatches_TraceListsRepeatedRejectionOnce(t *testing.T) {
+	const (
+		instanceID    = 1
+		sourceHash    = "0123456789abcdef0123456789abcdef01234567"
+		sourceName    = "Example.Movie.2020.1080p.WEB-DL.DDP5.1.H.264-GROUP"
+		candidateName = "Example.Movie.2020.720p.WEB-DL.DDP5.1.H.264-GROUP"
+	)
+
+	filterCache := ttlcache.New[string, *AsyncIndexerFilteringState]()
+	filterCache.Set(asyncFilteringCacheKey(instanceID, sourceHash), &AsyncIndexerFilteringState{
+		CapabilitiesCompleted: true,
+		ContentCompleted:      true,
+		CapabilityIndexers:    []int{1},
+		FilteredIndexers:      []int{1},
+	}, ttlcache.DefaultTTL)
+
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("t") != "caps" {
+			requests.Add(1)
+		}
+		w.Header().Set("Content-Type", "application/rss+xml")
+		_, _ = fmt.Fprintf(w, `<rss version="2.0"><channel><title>Tracker One</title><item><title>%s</title><guid>candidate-guid</guid><size>123</size><enclosure url="https://example.invalid/candidate.torrent" length="123" type="application/x-bittorrent" /></item></channel></rss>`, candidateName)
+	}))
+	t.Cleanup(server.Close)
+
+	instance := &models.Instance{ID: instanceID, Name: "main"}
+	source := qbt.Torrent{Hash: sourceHash, Name: sourceName, Size: 123, Progress: 1}
+	service := &Service{
+		instanceStore: &fakeInstanceStore{instances: map[int]*models.Instance{instanceID: instance}},
+		jackettService: newJackettServiceWithIndexers([]*models.TorznabIndexer{
+			{ID: 1, Name: "Tracker One", BaseURL: server.URL, Backend: models.TorznabBackendNative, TimeoutSeconds: 5, Enabled: true},
+		}),
+		syncManager: newFakeSyncManager(instance, []qbt.Torrent{source}, map[string]qbt.TorrentFiles{
+			sourceHash: {{Name: sourceName + ".mkv", Size: source.Size}},
+		}),
+		asyncFilteringCache: filterCache,
+		releaseCache:        NewReleaseCache(),
+		stringNormalizer:    stringutils.NewDefaultNormalizer(),
+	}
+
+	resp, _, _, err := service.searchTorrentMatches(context.Background(), instanceID, sourceHash, TorrentSearchOptions{}, nil)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.NotNil(t, resp.DecisionTrace)
+	require.Equal(t, int32(2), requests.Load(), "the primary pass and the yearless retry both ran")
+
+	trace := resp.DecisionTrace
+	assert.Equal(t, 1, trace.TotalResults)
+	assert.Equal(t, 0, trace.FinalMatches)
+	assert.Equal(t, 1, trace.SizeFiltered+trace.ReleaseFiltered)
+	total := 0
+	for _, n := range trace.RejectionCounts {
+		total += n
+	}
+	assert.Equal(t, 1, total)
+	require.Len(t, trace.RejectedCandidates, 1)
+	assert.Equal(t, candidateName, trace.RejectedCandidates[0].Title)
+	require.Len(t, trace.Indexers, 1)
+	assert.Equal(t, 1, trace.Indexers[0].Candidates)
 }

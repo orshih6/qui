@@ -191,8 +191,37 @@ func (g searchGatherer) gather(ctx, waitCtx context.Context, in gatherInput) (*j
 		}
 	}
 
-	resp.Results = results
+	resp.Results = deduplicateSearchResults(results)
 	return resp, covered, answered, nil
+}
+
+// searchResultDedupKey identifies one tracker result by GUID, then download
+// URL. An empty key means the result cannot be identified.
+func searchResultDedupKey(guid, downloadURL string) string {
+	if guid != "" {
+		return guid
+	}
+	return downloadURL
+}
+
+// deduplicateSearchResults keeps the first occurrence of each result. A retry
+// pass can return the same results again when an indexer ignores the changed
+// parameter, and each copy would otherwise be classified and traced again.
+// Results without a key stay separate.
+func deduplicateSearchResults(results []jackett.SearchResult) []jackett.SearchResult {
+	seen := make(map[string]struct{}, len(results))
+	deduplicated := make([]jackett.SearchResult, 0, len(results))
+	for _, res := range results {
+		key := searchResultDedupKey(res.GUID, res.DownloadURL)
+		if key != "" {
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+		}
+		deduplicated = append(deduplicated, res)
+	}
+	return deduplicated
 }
 
 // indexersWithoutResults returns the requested indexer IDs that produced no

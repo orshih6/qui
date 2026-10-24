@@ -308,3 +308,90 @@ func TestGatherSearchResults(t *testing.T) {
 		})
 	}
 }
+
+// TestGatherDeduplicatesRetryResults pins that a result a retry pass returns
+// again reaches the match loop once, so the trace lists and counts it once.
+func TestGatherDeduplicatesRetryResults(t *testing.T) {
+	const match, junk = "match", "junk"
+	hit := func(indexerID int, title, guid, downloadURL string) jackett.SearchResult {
+		return jackett.SearchResult{IndexerID: indexerID, Title: title, GUID: guid, DownloadURL: downloadURL}
+	}
+
+	tests := []struct {
+		name       string
+		req        jackett.TorznabSearchRequest
+		altTitle   string
+		replies    map[string]fakeReply
+		wantTitles []string
+	}{
+		{
+			name: "yearless retry repeating a GUID keeps the first copy",
+			req:  jackett.TorznabSearchRequest{Query: "Movie", Year: 2020, IndexerIDs: []int{1}},
+			replies: map[string]fakeReply{
+				replyKey("Movie", 2020, []int{1}): {results: []jackett.SearchResult{hit(1, "junk-a", "a", "")}, covered: []int{1}},
+				replyKey("Movie", 0, []int{1}):    {results: []jackett.SearchResult{hit(1, "junk-a again", "a", ""), hit(1, "junk-b", "b", "")}, covered: []int{1}},
+			},
+			wantTitles: []string{"junk-a", "junk-b"},
+		},
+		{
+			name:     "per-indexer retry repeating a GUID keeps the first copy",
+			req:      jackett.TorznabSearchRequest{Query: "Show", IndexerIDs: []int{1, 2}},
+			altTitle: "Alias",
+			replies: map[string]fakeReply{
+				replyKey("Show", 0, []int{1, 2}): {results: []jackett.SearchResult{hit(1, match, "m", ""), hit(2, "junk-a", "a", "")}, covered: []int{1, 2}},
+				replyKey("Alias", 0, []int{2}):   {results: []jackett.SearchResult{hit(2, "junk-a again", "a", ""), hit(2, match, "m2", "")}, covered: []int{2}},
+			},
+			wantTitles: []string{match, "junk-a", match},
+		},
+		{
+			name: "download URL identifies a result without a GUID",
+			req:  jackett.TorznabSearchRequest{Query: "Movie", Year: 2020, IndexerIDs: []int{1}},
+			replies: map[string]fakeReply{
+				replyKey("Movie", 2020, []int{1}): {results: []jackett.SearchResult{hit(1, "junk-a", "", "https://x/a")}, covered: []int{1}},
+				replyKey("Movie", 0, []int{1}):    {results: []jackett.SearchResult{hit(1, "junk-a again", "", "https://x/a")}, covered: []int{1}},
+			},
+			wantTitles: []string{"junk-a"},
+		},
+		{
+			name: "different GUIDs from one indexer both stay",
+			req:  jackett.TorznabSearchRequest{Query: "Movie", Year: 2020, IndexerIDs: []int{1}},
+			replies: map[string]fakeReply{
+				replyKey("Movie", 2020, []int{1}): {results: []jackett.SearchResult{hit(1, "junk-a", "a", "")}, covered: []int{1}},
+				replyKey("Movie", 0, []int{1}):    {results: []jackett.SearchResult{hit(1, "junk-b", "b", "")}, covered: []int{1}},
+			},
+			wantTitles: []string{"junk-a", "junk-b"},
+		},
+		{
+			name: "results without GUID or download URL both stay",
+			req:  jackett.TorznabSearchRequest{Query: "Movie", Year: 2020, IndexerIDs: []int{1}},
+			replies: map[string]fakeReply{
+				replyKey("Movie", 2020, []int{1}): {results: []jackett.SearchResult{hit(1, junk, "", "")}, covered: []int{1}},
+				replyKey("Movie", 0, []int{1}):    {results: []jackett.SearchResult{hit(1, junk, "", "")}, covered: []int{1}},
+			},
+			wantTitles: []string{junk, junk},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := searchGatherer{
+				search: func(_ context.Context, req *jackett.TorznabSearchRequest) (*jackett.SearchResponse, error) {
+					reply, ok := tt.replies[replyKey(req.Query, req.Year, req.IndexerIDs)]
+					require.True(t, ok, "unexpected pass %q year %d indexers %v", req.Query, req.Year, req.IndexerIDs)
+					return &jackett.SearchResponse{Results: reply.results, CoveredIndexerIDs: reply.covered}, nil
+				},
+				idCapIndexers: func(context.Context, *jackett.TorznabSearchRequest) []int { return nil },
+				usable:        func(r jackett.SearchResult) bool { return r.Title == match },
+			}
+
+			req := tt.req
+			resp, _, _, err := g.gather(t.Context(), t.Context(), gatherInput{req: &req, altTitle: tt.altTitle})
+			require.NoError(t, err)
+			titles := make([]string, 0, len(resp.Results))
+			for _, r := range resp.Results {
+				titles = append(titles, r.Title)
+			}
+			require.Equal(t, tt.wantTitles, titles)
+		})
+	}
+}
